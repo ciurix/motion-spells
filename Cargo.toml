@@ -1,0 +1,26 @@
+[package]
+name = "fils-project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ESP32-S3 Hardware Abstraction Layer
+esp-hal = { version = "1.1.0", features = ["esp32s3", "unstable"] }
+
+# Panic handler for ESP32-S3
+esp-backtrace = { version = "0.19.0", features = ["esp32s3", "panic-handler", "println"] }
+
+# Serial println! macro for ESP32-S3
+esp-println = { version = "0.17.0", features = ["esp32s3"] }
+
+# Required by espflash 4.4.0+
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = "fat"
+
+[profile.dev]
+debug = true
+opt-level = "z"
