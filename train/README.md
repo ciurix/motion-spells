@@ -11,10 +11,12 @@ capture.rs  ->  data/*.txt  ->  train_spells.py  ->  model/spells.tflite  ->  fi
 
 Flash the capture firmware and record one file per spell:
 
-```
+Run these from the repository root, not from `train/`:
+
+```powershell
 cargo build --release --bin capture
 espflash flash --port COM6 target/xtensa-esp32s3-none-elf/release/capture
-espflash monitor --port COM6 | Tee-Object -Encoding utf8 data/left.txt
+espflash monitor --port COM6 | Tee-Object data\left.txt
 ```
 
 Press **BOOT**, wait for `# GO`, perform the gesture. Each press records a
@@ -22,9 +24,16 @@ Press **BOOT**, wait for `# GO`, perform the gesture. Each press records a
 with Ctrl-C when the file has enough repetitions, then start the next spell.
 
 `Tee-Object` shows the output while saving it, so you can see `# GO` and
-confirm each gesture was recorded. Plain `>` redirection works too, but it
-writes UTF-16 and hides the prompts - the parser copes with the encoding
-either way, but recording blind makes it easy to miss a failed capture.
+confirm each gesture was recorded - recording blind makes it easy to miss a
+failed capture. Note that Windows PowerShell 5.1's `Tee-Object` has no
+`-Encoding` parameter and writes UTF-16; the parser detects that automatically,
+so no flag is needed.
+
+Then check what actually landed in the files:
+
+```powershell
+python train\check_captures.py data
+```
 
 Record roughly 25 repetitions per spell into these files:
 

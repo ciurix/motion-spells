@@ -145,26 +145,99 @@ def augment(x, y, factor, rng):
     return np.concatenate(xs), np.concatenate(ys)
 
 
-def build_model(tf, channels, n_classes):
-    """Small CNN using only operators MicroFlow can run."""
+def build_model(tf, channels, n_classes, batch_size=None):
+    """Small CNN using only operators MicroFlow can run.
+
+    `batch_size` is left free for training and pinned to 1 for export - see the
+    export code for why that matters.
+    """
     layers = tf.keras.layers
-    return tf.keras.Sequential(
-        [
-            layers.Input(shape=(WINDOW, channels, 1)),
-            # Kernel spans every channel at once, so the first layer can key on
-            # how the axes move together rather than each axis in isolation.
-            layers.Conv2D(8, (4, channels), padding="same", activation="relu"),
-            layers.AveragePooling2D((3, 1)),
-            layers.Dropout(0.2),
-            layers.Conv2D(16, (4, 1), padding="same", activation="relu"),
-            layers.AveragePooling2D((3, 1)),
-            layers.Dropout(0.2),
-            layers.Flatten(),  # exported as Reshape
-            layers.Dense(16, activation="relu"),
-            layers.Dropout(0.2),
-            layers.Dense(n_classes, activation="softmax"),
-        ]
-    )
+
+    inp = layers.Input(shape=(WINDOW, channels, 1), batch_size=batch_size)
+    # Kernel spans every channel at once, so the first layer can key on how the
+    # axes move together rather than each axis in isolation.
+    x = layers.Conv2D(8, (4, channels), padding="same", activation="relu")(inp)
+    x = layers.AveragePooling2D((3, 1))(x)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Conv2D(16, (4, 1), padding="same", activation="relu")(x)
+    x = layers.AveragePooling2D((3, 1))(x)
+    x = layers.Dropout(0.2)(x)
+
+    # Deliberately NOT layers.Flatten(): Keras exports Flatten as a reshape whose
+    # target shape is computed at runtime, which pulls in a SHAPE operator that
+    # MicroFlow cannot execute. Naming the size explicitly keeps the reshape
+    # static, so the exported graph holds a plain RESHAPE.
+    flat = int(np.prod(x.shape[1:]))
+    x = layers.Reshape((flat,))(x)
+
+    x = layers.Dense(16, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(n_classes, activation="softmax")(x)
+    return tf.keras.Model(inp, out)
+
+
+# Everything MicroFlow can execute on-device. QUANTIZE/DEQUANTIZE are tolerated
+# because a fully int8 model should not contain them at all - if they show up,
+# the conversion did not go fully integer.
+MICROFLOW_OPS = {
+    "CONV_2D",
+    "DEPTHWISE_CONV_2D",
+    "FULLY_CONNECTED",
+    "AVERAGE_POOL_2D",
+    "RESHAPE",
+    "SOFTMAX",
+    "RELU",
+    "RELU6",
+}
+
+
+def check_ops(tf, tflite):
+    """Fail loudly here rather than at firmware build time.
+
+    A model that trains perfectly can still be unusable on-device if it contains
+    an operator the inference engine lacks.
+    """
+    try:
+        interp = tf.lite.Interpreter(model_content=tflite)
+        interp.allocate_tensors()
+        ops = sorted({d["op_name"] for d in interp._get_ops_details()})
+    except Exception as exc:  # older/newer TF without the private helper
+        print(f"(could not inspect operators: {exc})")
+        return
+
+    # DELEGATE is the interpreter's XNNPACK acceleration showing up in the op
+    # list - a property of how we are inspecting the model, not of the model.
+    ops = [o for o in ops if o != "DELEGATE"]
+
+    print("Operators used:", ", ".join(ops))
+    bad = [o for o in ops if o not in MICROFLOW_OPS]
+    if bad:
+        print(
+            f"\n!! {', '.join(bad)} is not supported by MicroFlow - the firmware "
+            f"will refuse to build.\n"
+            f"   Supported: {', '.join(sorted(MICROFLOW_OPS))}",
+            file=sys.stderr,
+        )
+    else:
+        print("All operators are supported by MicroFlow.")
+
+    # MicroFlow's fully_connected takes exactly one quantisation scale per
+    # tensor, so a per-channel tensor stops the firmware compiling.
+    multi = [
+        t["name"]
+        for t in interp.get_tensor_details()
+        if len(t.get("quantization_parameters", {}).get("scales", [])) > 1
+    ]
+    if multi:
+        print(
+            f"\n!! {len(multi)} tensor(s) are quantised per-channel, e.g. "
+            f"{multi[0][:60]}\n"
+            f"   MicroFlow needs per-tensor quantisation - the firmware will "
+            f"refuse to build.",
+            file=sys.stderr,
+        )
+    else:
+        print("Quantisation is per-tensor, as MicroFlow requires.")
 
 
 def confusion(y_true, y_pred, n):
@@ -259,8 +332,30 @@ def main():
         for sample in x_train[:200]:
             yield [sample[None].astype(np.float32)]
 
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    # Export from a copy whose batch dimension is pinned to 1. With a dynamic
+    # batch, Keras builds even a fixed-size reshape out of
+    # tf.shape -> strided_slice -> pack, dragging in operators MicroFlow cannot
+    # execute; a concrete batch lets the converter fold that into a constant
+    # reshape. The device only ever classifies one window at a time anyway.
+    #
+    # Done by copying weights into a second model rather than converting a
+    # concrete function, because that route leaves the weights as resource
+    # variables and quantisation calibration then fails on READ_VARIABLE.
+    export_model = build_model(tf, args.channels, n_classes, batch_size=1)
+    export_model.set_weights(model.get_weights())
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(export_model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    # Force per-tensor (one scale per tensor) instead of TFLite's default
+    # per-channel weight quantisation. MicroFlow's fully_connected only accepts a
+    # single quantisation scale, so a per-channel Dense layer fails to compile.
+    # Its conv_2d does handle per-channel, but there is no converter switch for
+    # "convolutions only", and the accuracy difference on a model this small is
+    # negligible.
+    converter._experimental_disable_per_channel = True
+    if hasattr(converter, "_experimental_disable_per_channel_quantization_for_dense_layers"):
+        converter._experimental_disable_per_channel_quantization_for_dense_layers = True
     converter.representative_dataset = representative
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
@@ -275,6 +370,8 @@ def main():
 
     print(f"\nWrote {model_path} ({len(tflite)} bytes)")
     print(f"Wrote {out_dir / 'labels.txt'}: {', '.join(labels)}")
+
+    check_ops(tf, tflite)
 
     # Sanity-check the quantised model, since quantisation can cost accuracy.
     interp = tf.lite.Interpreter(model_content=tflite)

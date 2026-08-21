@@ -3,3 +3,10 @@
 # Python
 __pycache__/
 *.pyc
+
+# Colab upload bundle (regenerate as needed)
+spells_training.zip
+
+# Colab downloads land in the root; the tracked copies live in model/
+/spells.tflite
+/labels.txt
