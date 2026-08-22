@@ -1,4 +1,5 @@
-/target
+# Not anchored, so it matches wand/target too
+target/
 
 # Python
 __pycache__/

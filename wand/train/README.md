@@ -11,7 +11,7 @@ capture.rs  ->  data/*.txt  ->  train_spells.py  ->  model/spells.tflite  ->  fi
 
 Flash the capture firmware and record one file per spell:
 
-Run these from the repository root, not from `train/`:
+Run these from `wand/`, not from `wand/train/`:
 
 ```powershell
 cargo build --release --bin capture
