@@ -1,7 +1,14 @@
-//! Controller: STM32U545RE-Q driving an SSD1306 OLED over I2C.
+//! Controller: STM32U545RE-Q showing the spell the wand just cast.
+//!
+//! The wand broadcasts over ESP-NOW; a NodeMCU receives it and forwards the
+//! spell name as a line of text over UART. This end waits on that line and
+//! draws it to an SSD1306 OLED.
 //!
 //! Wiring, to the Arduino header on the Nucleo:
-//!   SCL -> D15 (PB6)    SDA -> D14 (PB7)    VCC -> 3V3    GND -> GND
+//!   OLED   SCL -> D15 (PB6)   SDA -> D14 (PB7)   VCC -> 3V3   GND -> GND
+//!   NodeMCU TX  -> D0  (PA3)  RX  -> D1  (PA2)   GND -> GND
+//!
+//! Note the crossover: the NodeMCU's TX goes to the STM32's RX.
 //!
 //! Run with `cargo run --release`, which flashes over the on-board ST-Link and
 //! streams the defmt logs back.
@@ -14,6 +21,7 @@ use embassy_executor::Spawner;
 use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::rcc::Sysclk;
 use embassy_stm32::time::Hertz;
+use embassy_stm32::usart::{self, UartRx};
 use embassy_time::{Duration, Timer};
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, ascii::FONT_9X18_BOLD, MonoTextStyleBuilder},
@@ -22,13 +30,61 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Baseline, Text},
 };
-use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
 
 use defmt_rtt as _;
 use panic_probe as _;
 
 /// SSD1306 modules are strapped to 0x3C almost always, 0x3D occasionally.
 const CANDIDATE_ADDRS: [u8; 2] = [0x3C, 0x3D];
+
+/// Longest line we will accept before assuming the sender is confused.
+const LINE_MAX: usize = 32;
+
+/// What each spell does. The wand sends the name; this end owns the meaning,
+/// so the mapping can change without reflashing the wand.
+fn action_for(spell: &str) -> Option<&'static str> {
+    Some(match spell {
+        "LEFT" => "prev interface",
+        "RIGHT" => "next interface",
+        "UP" => "interface up",
+        "DOWN" => "interface down",
+        "PUSH" => "iperf3 flood",
+        "CIRCULAR" => "backup config",
+        _ => return None,
+    })
+}
+
+type Display<'a> = Ssd1306<
+    I2CInterface<I2c<'a, embassy_stm32::mode::Blocking, i2c::Master>>,
+    DisplaySize128x64,
+    BufferedGraphicsMode<DisplaySize128x64>,
+>;
+
+/// Draws a heading with a rule under it and a line of detail beneath.
+fn draw_screen(display: &mut Display<'_>, heading: &str, detail: &str) {
+    let title_style = MonoTextStyleBuilder::new()
+        .font(&FONT_9X18_BOLD)
+        .text_color(BinaryColor::On)
+        .build();
+    let body_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    display.clear(BinaryColor::Off).ok();
+    Text::with_baseline(heading, Point::new(4, 8), title_style, Baseline::Top)
+        .draw(display)
+        .ok();
+    Rectangle::new(Point::new(0, 30), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+    Text::with_baseline(detail, Point::new(4, 38), body_style, Baseline::Top)
+        .draw(display)
+        .ok();
+    display.flush().ok();
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -43,6 +99,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(config);
     info!("controller starting");
 
+    // --- OLED on I2C1 ---
     // 400 kHz is the SSD1306's fast-mode rating; drop to 100 kHz if the wiring
     // is long or flaky. The module carries its own pull-ups, so the internal
     // ones stay off.
@@ -60,16 +117,16 @@ async fn main(_spawner: Spawner) {
 
     // Probe before assuming: a zero-length write is answered only if something
     // is actually listening at that address.
-    let mut addr = None;
+    let mut found = false;
     for candidate in CANDIDATE_ADDRS {
         if i2c.blocking_write(candidate, &[]).is_ok() {
             info!("display responded at {=u8:#04x}", candidate);
-            addr = Some(candidate);
+            found = true;
             break;
         }
     }
-    if addr.is_none() {
-        warn!("no display found at 0x3C or 0x3D - scanning the whole bus");
+    if !found {
+        warn!("no display at 0x3C or 0x3D - scanning the whole bus");
         for candidate in 0x03..=0x77u8 {
             if i2c.blocking_write(candidate, &[]).is_ok() {
                 warn!("something is at {=u8:#04x}", candidate);
@@ -82,79 +139,82 @@ async fn main(_spawner: Spawner) {
     let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
 
-    match display.init() {
-        Ok(()) => info!("display initialised"),
+    if display.init().is_err() {
+        // Nothing more to do without a screen, but keep the logs alive so the
+        // failure is visible over RTT rather than looking like a hang.
+        defmt::error!("display init failed - check wiring and power");
+        loop {
+            Timer::after(Duration::from_secs(1)).await;
+        }
+    }
+    info!("display initialised");
+
+    // --- Link to the NodeMCU on LPUART1 ---
+    // USART1 is wired to the ST-Link virtual COM port on this board, so the
+    // Arduino D0/D1 pins are LPUART1 instead.
+    let mut usart_config = usart::Config::default();
+    usart_config.baudrate = 115_200;
+    let mut uart = match UartRx::new_blocking(p.LPUART1, p.PA3 /* RX - D0 */, usart_config) {
+        Ok(uart) => uart,
         Err(_) => {
-            // Nothing more to do without a screen, but keep the logs alive so
-            // the failure is visible over RTT rather than looking like a hang.
-            defmt::error!("display init failed - check wiring and power");
+            defmt::error!("could not configure LPUART1");
             loop {
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
-    }
+    };
 
-    let title_style = MonoTextStyleBuilder::new()
-        .font(&FONT_9X18_BOLD)
-        .text_color(BinaryColor::On)
-        .build();
-    let body_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
+    draw_screen(&mut display, "SPELLS", "waiting for wand");
+    info!("waiting for spells on LPUART1 @115200 (PA3 / D0)");
 
-    // Splash screen, so it is obvious at a glance that the panel is alive.
-    display.clear(BinaryColor::Off).ok();
-    Text::with_baseline("SPELLS", Point::new(28, 8), title_style, Baseline::Top)
-        .draw(&mut display)
-        .ok();
-    Rectangle::new(Point::new(0, 30), Size::new(128, 1))
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-        .draw(&mut display)
-        .ok();
-    Text::with_baseline(
-        "waiting for wand",
-        Point::new(10, 38),
-        body_style,
-        Baseline::Top,
-    )
-    .draw(&mut display)
-    .ok();
-    display.flush().ok();
+    // Read a byte at a time and act on each complete line. Displaying is all
+    // this board does, so blocking here costs nothing.
+    let mut line = [0u8; LINE_MAX];
+    let mut len = 0usize;
 
-    info!("splash drawn");
-    Timer::after(Duration::from_secs(2)).await;
-
-    // Until the wand link exists, cycle through the spells so the display has
-    // something to show and the render path gets exercised.
-    let spells: [(&str, &str); 6] = [
-        ("LEFT", "prev interface"),
-        ("RIGHT", "next interface"),
-        ("UP", "interface up"),
-        ("DOWN", "interface down"),
-        ("PUSH", "iperf3 flood"),
-        ("CIRCULAR", "backup config"),
-    ];
-
-    let mut i = 0usize;
     loop {
-        let (name, action) = spells[i % spells.len()];
-        i += 1;
+        let mut byte = [0u8; 1];
+        if uart.blocking_read(&mut byte).is_err() {
+            // A framing or overrun error usually means the baud rates disagree
+            // or the wiring is noisy. Drop the partial line and resynchronise.
+            warn!("uart read error - discarding partial line");
+            len = 0;
+            continue;
+        }
 
-        display.clear(BinaryColor::Off).ok();
-        Text::with_baseline(name, Point::new(4, 6), title_style, Baseline::Top)
-            .draw(&mut display)
-            .ok();
-        Rectangle::new(Point::new(0, 28), Size::new(128, 1))
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(&mut display)
-            .ok();
-        Text::with_baseline(action, Point::new(4, 36), body_style, Baseline::Top)
-            .draw(&mut display)
-            .ok();
-        display.flush().ok();
+        match byte[0] {
+            b'\n' | b'\r' => {
+                if len == 0 {
+                    continue; // bare newline, or the \r of a \r\n pair
+                }
+                let text = core::str::from_utf8(&line[..len]).unwrap_or("");
+                let spell = text.trim();
 
-        info!("showing {}", name);
-        Timer::after(Duration::from_millis(1500)).await;
+                match action_for(spell) {
+                    Some(action) => {
+                        info!("cast: {}", spell);
+                        draw_screen(&mut display, spell, action);
+                    }
+                    None => {
+                        // Show it anyway: an unknown name means the wand and
+                        // this table disagree, which is worth seeing on screen.
+                        warn!("unknown spell: {}", spell);
+                        draw_screen(&mut display, "?", spell);
+                    }
+                }
+                len = 0;
+            }
+            b => {
+                if len < LINE_MAX {
+                    line[len] = b;
+                    len += 1;
+                } else {
+                    // Overlong line: drop it rather than truncate into a wrong
+                    // spell name.
+                    warn!("line too long - dropping");
+                    len = 0;
+                }
+            }
+        }
     }
 }
