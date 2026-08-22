@@ -156,6 +156,19 @@ fn main() -> ! {
         delay.delay_millis(400);
     }
 
+    // Cast each spell once, for testing the link and everything downstream
+    // without a gesture. Enabled by the `selftest` feature only.
+    #[cfg(feature = "selftest")]
+    {
+        println!("SELFTEST: casting each spell in turn");
+        for spell in ["LEFT", "RIGHT", "UP", "DOWN"] {
+            delay.delay_millis(2500);
+            println!(">>> {} (selftest)", spell);
+            broadcast(&mut esp_now, spell);
+        }
+        println!("SELFTEST: done");
+    }
+
     let mut who = [0u8; 1];
     match i2c.write_read(MPU6050_ADDR, &[REG_WHO_AM_I], &mut who) {
         Ok(_) => println!("Sensor OK (WHO_AM_I = {:#04x})", who[0]),

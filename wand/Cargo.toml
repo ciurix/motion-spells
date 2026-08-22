@@ -43,6 +43,11 @@ ml = ["dep:microflow", "dep:nalgebra"]
 # Broadcasts each recognised spell over ESP-NOW.
 radio = ["dep:esp-radio", "dep:esp-rtos", "dep:esp-alloc"]
 
+# Broadcasts each spell once at startup, without needing a gesture. For testing
+# the link and everything downstream of it - never enable this in normal use, as
+# the controller will act on the spells as if they had been cast.
+selftest = ["radio"]
+
 # Only built with --features ml, so a missing model never breaks `cargo build`.
 [[bin]]
 name = "spells"
