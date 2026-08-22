@@ -43,14 +43,39 @@ tie the grounds together.
 
 ## Flashing
 
-Arduino IDE, with ESP8266 board support installed
-(Boards Manager URL `https://arduino.esp8266.com/stable/package_esp8266com_index.json`):
+Either the Arduino IDE or `arduino-cli`. No libraries to install - `ESP8266WiFi`
+and `espnow` ship with the core.
+
+With the IDE, having added the Boards Manager URL
+`https://arduino.esp8266.com/stable/package_esp8266com_index.json`:
 
 1. Tools > Board > NodeMCU 1.0 (ESP-12E Module)
-2. Tools > Port > the NodeMCU's COM port
+2. Tools > Port > the NodeMCU's port
 3. Upload
 
-No libraries to install - `ESP8266WiFi` and `espnow` ship with the core.
+With `arduino-cli`, from the `controller/` directory:
+
+```
+arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+arduino-cli core update-index
+arduino-cli core install esp8266:esp8266
+arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 nodemcu-bridge
+arduino-cli upload -p COM9 --fqbn esp8266:esp8266:nodemcuv2 nodemcu-bridge
+```
+
+## Watching it run
+
+The USB console runs at 115200 and should show:
+
+```
+nodemcu esp-now bridge
+mac: 24:4C:AB:6C:7F:05
+channel: 1
+listening for spells
+```
+
+Unreadable characters before that are the ESP8266's bootloader, which prints at
+74880 baud regardless of what the sketch later selects. Not a fault.
 
 ## Channel
 
