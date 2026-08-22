@@ -41,6 +41,13 @@ const CANDIDATE_ADDRS: [u8; 2] = [0x3C, 0x3D];
 /// Longest line we will accept before assuming the sender is confused.
 const LINE_MAX: usize = 32;
 
+/// Network being managed. Injected from the gitignored .env by build.rs; the
+/// fallback is only used when .env is absent (e.g. a fresh checkout).
+const NETWORK: &str = match option_env!("WIFI_SSID") {
+    Some(name) => name,
+    None => "network",
+};
+
 /// What each spell does. The wand sends the name; this end owns the meaning,
 /// so the mapping can change without reflashing the wand.
 fn action_for(spell: &str) -> Option<&'static str> {
@@ -84,6 +91,59 @@ fn draw_screen(display: &mut Display<'_>, heading: &str, detail: &str) {
         .draw(display)
         .ok();
     display.flush().ok();
+}
+
+/// Boot screen: "managing <network>" over a progress bar that fills once, then
+/// the screen is left showing the network. Cosmetic - the STM32 does not join
+/// WiFi itself; it announces which network the system is looking after.
+async fn boot_animation(display: &mut Display<'_>) {
+    let heading = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let name_style = MonoTextStyleBuilder::new()
+        .font(&FONT_9X18_BOLD)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Bar geometry: an outlined track that fills left to right.
+    let bar_x = 4i32;
+    let bar_y = 48i32;
+    let bar_w = 120u32;
+    let bar_h = 10u32;
+
+    const STEPS: u32 = 48;
+    for step in 0..=STEPS {
+        display.clear(BinaryColor::Off).ok();
+
+        Text::with_baseline("managing", Point::new(4, 6), heading, Baseline::Top)
+            .draw(display)
+            .ok();
+        Text::with_baseline(NETWORK, Point::new(4, 22), name_style, Baseline::Top)
+            .draw(display)
+            .ok();
+
+        // Track outline.
+        Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
+            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+            .draw(display)
+            .ok();
+        // Fill proportional to progress, inset by one pixel so it sits inside
+        // the outline.
+        let fill = (bar_w - 2) * step / STEPS;
+        if fill > 0 {
+            Rectangle::new(
+                Point::new(bar_x + 1, bar_y + 1),
+                Size::new(fill, bar_h - 2),
+            )
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display)
+            .ok();
+        }
+
+        display.flush().ok();
+        Timer::after(Duration::from_millis(45)).await;
+    }
 }
 
 #[embassy_executor::main]
@@ -164,8 +224,9 @@ async fn main(_spawner: Spawner) {
         }
     };
 
+    boot_animation(&mut display).await;
     draw_screen(&mut display, "SPELLS", "waiting for wand");
-    info!("waiting for spells on LPUART1 @115200 (PA3 / D0)");
+    info!("managing {}, waiting for spells on LPUART1 @115200 (PA3 / D0)", NETWORK);
 
     // Read a byte at a time and act on each complete line. Displaying is all
     // this board does, so blocking here costs nothing.

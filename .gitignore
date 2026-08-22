@@ -1,3 +1,6 @@
+# Secrets - real credentials live here, never committed. See .env.example.
+.env
+
 # Not anchored, so it matches wand/target too
 target/
 
