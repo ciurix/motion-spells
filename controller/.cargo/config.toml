@@ -1,0 +1,9 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# `cargo run` flashes over the on-board ST-Link and streams defmt logs back.
+runner = "probe-rs run --chip STM32U545RETx"
+
+[env]
+DEFMT_LOG = "debug"

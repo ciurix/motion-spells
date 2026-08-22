@@ -1,0 +1,36 @@
+[package]
+name = "controller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# STM32 Hardware Abstraction Layer from Embassy
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32u545re", "unstable-pac", "memory-x", "time-driver-any", "exti"] }
+
+# Embassy Async Executor
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+
+# Embassy Time management
+embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
+
+# Cortex-M specific runtime and APIs with critical-section implementation
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.3"
+
+# Defmt logging over RTT (for probe-rs)
+defmt = "0.3.8"
+defmt-rtt = "0.4.1"
+panic-probe = { version = "0.3.1", features = ["print-defmt"] }
+
+# SSD1306 OLED driver and the drawing primitives it renders
+ssd1306 = "0.9.0"
+embedded-graphics = "0.8.1"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = "fat"
+
+[profile.dev]
+debug = true
+opt-level = "z"
