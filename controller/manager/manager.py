@@ -172,6 +172,18 @@ def spells_from_serial(port, baud):
 
     known = {"LEFT", "RIGHT", "UP", "DOWN", "PUSH", "CIRCULAR"}
     with serial.Serial(port, baud, timeout=1) as ser:
+        # On a NodeMCU the USB-serial adapter's DTR/RTS lines are wired to the
+        # ESP8266's GPIO0 and RESET. Opening the port asserts them by default,
+        # which holds the board in reset (or drops it into flash mode) so it
+        # never runs and nothing is ever received. Release them and pulse RESET
+        # to boot it into run mode.
+        ser.dtr = False
+        ser.rts = True
+        time.sleep(0.1)
+        ser.rts = False
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+
         print(f"listening for spells on {port} @ {baud}")
         buffer = b""
         while True:

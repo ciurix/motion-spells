@@ -108,7 +108,7 @@ fn main() -> ! {
     // The scheduler must be running before the radio is initialised, and both
     // must be set up before the first transmission.
     #[cfg(feature = "radio")]
-    let _wifi;
+    let mut _wifi;
     #[cfg(feature = "radio")]
     let mut esp_now = {
         use esp_hal::interrupt::software::SoftwareInterruptControl;
@@ -126,6 +126,15 @@ fn main() -> ! {
 
         _wifi = esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default())
             .expect("wifi init failed");
+
+        // Applying a config is what actually starts the interface: esp-radio
+        // only calls esp_wifi_start() from set_config, and only when the mode
+        // changes. Without this the radio never transmits - sends are accepted
+        // and their completion callback fires, but nothing reaches the air.
+        if let Err(e) = _wifi.set_config(&esp_radio::wifi::Config::Station(Default::default())) {
+            println!("WARNING: could not start wifi: {:?}", e);
+        }
+
         let esp_now = _wifi.esp_now();
 
         // ESP-NOW only reaches peers on the same channel, and the NodeMCU
@@ -136,6 +145,16 @@ fn main() -> ! {
         println!("Radio up: broadcasting spells on channel 1");
         esp_now
     };
+
+    // Radio self-test: three broadcasts at boot, so the link can be checked
+    // without having to cast a gesture. If these do not appear on the bridge's
+    // console, the problem is the radio, not the recogniser.
+    #[cfg(feature = "radio")]
+    for i in 0..3 {
+        broadcast(&mut esp_now, "PING");
+        println!("radio self-test {}/3 sent", i + 1);
+        delay.delay_millis(400);
+    }
 
     let mut who = [0u8; 1];
     match i2c.write_read(MPU6050_ADDR, &[REG_WHO_AM_I], &mut who) {
