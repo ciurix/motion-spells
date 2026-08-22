@@ -68,6 +68,30 @@ fn action_for(label: &str) -> &'static str {
     }
 }
 
+/// Broadcasts the spell so any listener on the channel picks it up. Using the
+/// broadcast address avoids having to know the receiver's MAC.
+#[cfg(feature = "radio")]
+fn broadcast(esp_now: &mut esp_radio::esp_now::EspNow<'_>, spell: &str) {
+    // Newline-terminated: the controller reads a line at a time.
+    let mut frame = [0u8; 24];
+    let name = spell.as_bytes();
+    if name.len() + 1 > frame.len() {
+        return;
+    }
+    frame[..name.len()].copy_from_slice(name);
+    frame[name.len()] = b'\n';
+
+    match esp_now.send(&esp_radio::esp_now::BROADCAST_ADDRESS, &frame[..name.len() + 1]) {
+        // Waiting keeps the next send from starting before this one lands.
+        Ok(waiter) => {
+            if waiter.wait().is_err() {
+                println!("    (radio: send failed)");
+            }
+        }
+        Err(_) => println!("    (radio: could not queue)"),
+    }
+}
+
 #[esp_hal::main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -79,6 +103,39 @@ fn main() -> ! {
         .with_scl(peripherals.GPIO13);
 
     println!("=== Motion Spells (neural network) ===");
+
+    // --- Radio ---
+    // The scheduler must be running before the radio is initialised, and both
+    // must be set up before the first transmission.
+    #[cfg(feature = "radio")]
+    let _wifi;
+    #[cfg(feature = "radio")]
+    let mut esp_now = {
+        use esp_hal::interrupt::software::SoftwareInterruptControl;
+        use esp_hal::timer::timg::TimerGroup;
+
+        // The radio needs a heap under it. The reclaimed region is RAM the ROM
+        // bootloader no longer needs once we are running, which would otherwise
+        // sit unused.
+        esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+        esp_alloc::heap_allocator!(size: 36 * 1024);
+
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
+        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+        _wifi = esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default())
+            .expect("wifi init failed");
+        let esp_now = _wifi.esp_now();
+
+        // ESP-NOW only reaches peers on the same channel, and the NodeMCU
+        // bridge sits on channel 1.
+        if esp_now.set_channel(1).is_err() {
+            println!("WARNING: could not set radio channel");
+        }
+        println!("Radio up: broadcasting spells on channel 1");
+        esp_now
+    };
 
     let mut who = [0u8; 1];
     match i2c.write_read(MPU6050_ADDR, &[REG_WHO_AM_I], &mut who) {
@@ -147,6 +204,21 @@ fn main() -> ! {
                         action_for(label),
                         confidence * 100.0
                     );
+
+                    // The controller expects upper case, matching its table.
+                    #[cfg(feature = "radio")]
+                    {
+                        let mut upper = [0u8; 16];
+                        let bytes = label.as_bytes();
+                        let n = bytes.len().min(upper.len());
+                        for i in 0..n {
+                            upper[i] = bytes[i].to_ascii_uppercase();
+                        }
+                        if let Ok(text) = core::str::from_utf8(&upper[..n]) {
+                            broadcast(&mut esp_now, text);
+                        }
+                    }
+
                     cooldown = COOLDOWN;
                 }
             }

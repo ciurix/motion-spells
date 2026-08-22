@@ -8,4 +8,6 @@ runner = "espflash flash --monitor"
 ESP_LOG = "info"
 
 [unstable]
-build-std = ["core"]
+# alloc as well as core: the radio stack (esp-radio) needs a heap, so its
+# dependencies pull in `alloc` even though our own code stays allocation-free.
+build-std = ["core", "alloc"]
