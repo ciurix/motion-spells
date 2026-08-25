@@ -29,6 +29,21 @@ static const uint8_t ESPNOW_CHANNEL = 1;
 // Longest spell name we will pass on; anything larger is a malformed packet.
 static const size_t MAX_SPELL = 32;
 
+// The wand broadcasts each spell three times, because an ESP-NOW broadcast is
+// never acknowledged or retried and a single frame lost to a collision would be
+// lost silently. Those copies must not become three casts downstream - LEFT
+// would step three interfaces, and the router manager would run the command
+// three times.
+//
+// Identical spells arriving inside this window are therefore treated as the
+// sender's repeats. That is safe because the wand cannot legitimately repeat a
+// spell any faster than its own cooldown, which is about 1.2 seconds - comfort-
+// ably longer than this - while its three copies land within about 30 ms.
+static const unsigned long DEDUP_MS = 400;
+
+static char lastSpell[MAX_SPELL + 1] = "";
+static unsigned long lastSpellAt = 0;
+
 void onSpellReceived(uint8_t *mac, uint8_t *data, uint8_t len) {
   if (len == 0 || len > MAX_SPELL) {
     Serial.printf("ignoring %u byte packet\n", len);
@@ -49,6 +64,18 @@ void onSpellReceived(uint8_t *mac, uint8_t *data, uint8_t len) {
   if (n == 0) {
     return;
   }
+
+  // Unsigned subtraction, so this stays correct across the millis() rollover.
+  unsigned long now = millis();
+  if (strcmp(spell, lastSpell) == 0 && (now - lastSpellAt) < DEDUP_MS) {
+    // A repeat of the one just handled. Logged, not forwarded: seeing these on
+    // the console is how you know the retries are arriving at all.
+    Serial.printf("  (repeat of %s, ignored)\n", spell);
+    return;
+  }
+  strncpy(lastSpell, spell, MAX_SPELL);
+  lastSpell[MAX_SPELL] = '\0';
+  lastSpellAt = now;
 
   // To the STM32, and to the USB console so it can be watched while testing.
   Serial1.print(spell);

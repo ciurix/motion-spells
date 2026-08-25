@@ -34,9 +34,11 @@ def main():
         found[path.stem.lower()] = len(windows)
         total += len(windows)
         if len(windows) == 0:
-            status = "EMPTY - nothing recorded"
-        elif len(windows) < 10:
-            status = "thin - aim for 20+"
+            status = "EMPTY - nothing usable recorded"
+        elif len(windows) < 20:
+            status = "thin - aim for 40+"
+        elif len(windows) < 40:
+            status = "usable - more would help"
         else:
             status = "ok"
         print(f"{path.name:<16}{len(windows):>9}   {status}")

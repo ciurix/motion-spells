@@ -198,15 +198,27 @@ if ($ports.Count -eq 0) {
 }
 
 $haveProbe = $false
+$probeId = $null
 if ($have['probe-rs']) {
     $probes = Invoke-Timed 'probe-rs' @('list') $RepoRoot 20
-    if ($probes.Text -match 'STLink|ST-LINK|STLINK') {
-        Write-Ok "ST-Link found:"
-        Write-Host ($probes.Text.Trim()) -ForegroundColor DarkGray
+    Write-Host ($probes.Text.Trim()) -ForegroundColor DarkGray
+
+    # The wand's own USB shows up as an "ESP JTAG" debug probe, so with all
+    # three boards connected probe-rs sees two probes and stops to ask which one
+    # to use - which, with no console to answer on, just fails. Name the ST-Link
+    # explicitly instead. Its identifier is the VID:PID:serial in the listing.
+    foreach ($line in ($probes.Text -split "`n")) {
+        if ($line -match 'ST-?LINK' -and $line -match '--\s*([0-9a-fA-F]{4}:[0-9a-fA-F]{4}:\S+?)\s*\(') {
+            $probeId = $matches[1]
+            break
+        }
+    }
+
+    if ($probeId) {
+        Write-Ok "ST-Link selected: $probeId"
         $haveProbe = $true
     } else {
         Write-Warn2 "no ST-Link found - the STM32 steps will be skipped"
-        Write-Host ($probes.Text.Trim()) -ForegroundColor DarkGray
     }
 }
 
@@ -367,7 +379,7 @@ if (-not $haveProbe) {
     } else {
         Write-Ok "built"
         Write-Note "probe-rs run --chip STM32U545RETx (flashes, then streams logs for 20s)"
-        $run = Invoke-Timed 'probe-rs' @('run', '--chip', 'STM32U545RETx', $ctrlElf) $ctrlDir 20
+        $run = Invoke-Timed 'probe-rs' @('run', '--chip', 'STM32U545RETx', '--probe', $probeId, $ctrlElf) $ctrlDir 20
         Set-Content -Path (Join-Path $LogDir 'controller-boot.log') -Value $run.Text
         Write-Host ($run.Text.Trim()) -ForegroundColor DarkGray
 
@@ -425,7 +437,7 @@ if ($SkipEndToEnd) {
         Write-Note "attaching to the STM32"
         $errLog = "$e2eLog.err"
         $monitor = Start-Process -FilePath 'probe-rs' `
-            -ArgumentList @('attach', '--chip', 'STM32U545RETx', $ctrlElf) `
+            -ArgumentList @('attach', '--chip', 'STM32U545RETx', '--probe', $probeId, $ctrlElf) `
             -WorkingDirectory $ctrlDir -NoNewWindow -PassThru `
             -RedirectStandardOutput $e2eLog -RedirectStandardError $errLog
         Start-Sleep -Seconds 3

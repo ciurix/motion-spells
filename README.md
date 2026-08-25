@@ -87,10 +87,13 @@ The NodeMCU is flashed once and then left alone - see
 
 ## How the gesture recognition works
 
-The wand samples acceleration and rotation at 50 Hz and keeps the last 128
-samples - a 2.56 second window. Several times a second it runs that window
-through a small convolutional network compiled into the firmware, and if one
-class comes back above 80% confidence it announces that spell.
+The wand samples acceleration and rotation at 100 Hz and keeps the last 90
+samples - a 0.9 second window. When the wand comes to rest after being moved, it
+runs that window through a small convolutional network compiled into the
+firmware, and if one class comes back above 80% confidence it announces that
+spell. Classifying on rest rather than on a timer matters: inference takes 52 ms
+during which nothing is sampled, and on a timer that pause would land in the
+middle of the swing.
 
 The model is trained offline from recordings made with the wand itself. See
 `wand/train/README.md` for the pipeline, and `wand/README.md` for how inference
@@ -100,10 +103,10 @@ is wired into the firmware.
 
 Working end to end: a gesture on the wand appears on the controller's display.
 
-The model currently knows four gestures - left, right, up and down. Still to
-record are *push*, *circular*, and the *negative* class that lets the model
-decide a movement was not a spell at all; without it every movement is forced
-into one of the four it knows.
+The model knows five spells - left, right, up, down and push - plus a *negative*
+class that lets it decide a movement was not a spell at all. Trained on 280
+recordings: 40 per spell and 80 negative. *Circular* is not recorded; a full
+circle does not comfortably fit the 0.9 second window.
 
 The controller displays the action but does not yet carry it out. Doing that
 needs a route from the STM32 to the router, and the router platform decided.

@@ -20,11 +20,25 @@ import sys
 
 import numpy as np
 
-# Samples per gesture window - must match WINDOW in src/bin/capture.rs.
-WINDOW = 128
-# Raw counts -> physical units, at the MPU6050's default ranges.
-ACCEL_LSB_PER_G = 16384.0
-GYRO_LSB_PER_DPS = 131.0
+# Samples the model sees: 90 at 100 Hz is a 0.9 s window. Must match WINDOW and
+# PERIOD_MS in src/bin/spells.rs.
+WINDOW = 90
+# Samples per recording - must match CAPTURE in src/bin/capture.rs. Longer than
+# WINDOW so nobody has to start a gesture on cue; the extra is cropped away.
+CAPTURE = 150
+# Raw counts -> physical units, at the ranges capture.rs configures
+# (+-8 g and +-1000 deg/s, not the sensor's defaults).
+ACCEL_LSB_PER_G = 4096.0
+GYRO_LSB_PER_DPS = 32.8
+# A reading this large ran out of range and its true value is unknown.
+CLIP_LEVEL = 32_000
+
+# The firmware's movement detector, mirrored here so that training windows are
+# cut at the same instant the wand cuts them. These must match RECENT,
+# ACTIVE_GATE and QUIET_GATE in src/bin/spells.rs.
+RECENT = 12
+ACTIVE_GATE = 2.0
+QUIET_GATE = 0.8
 
 
 def is_separator(line):
@@ -58,24 +72,28 @@ def read_text_any_encoding(path):
 
 
 def parse_capture_file(path):
-    """Split one capture file into a list of (WINDOW, 6) float arrays.
+    """Split one capture file into a list of (CAPTURE, 6) float arrays.
 
     The firmware prints a separator line before each gesture and comment lines
-    starting with '#', so windows are whatever sits between separators.
+    starting with '#', so recordings are whatever sits between separators.
     """
     windows, current = [], []
+    # Counted rather than reported one by one: a whole file in the wrong format
+    # would otherwise print the same complaint a hundred times over.
+    dropped_old, dropped_short = [], []
 
     def flush():
         if not current:
             return
-        if len(current) == WINDOW:
+        if len(current) == CAPTURE:
             windows.append(np.array(current, dtype=np.float32))
+        elif len(current) == 128:
+            # The old format: 128 samples at 50 Hz, taken at the sensor's
+            # default ranges. Neither the length nor the scaling matches, and
+            # the gestures were performed slowly, so these cannot be reused.
+            dropped_old.append(len(current))
         else:
-            print(
-                f"  ! {path.name}: dropped a window with {len(current)} rows "
-                f"(expected {WINDOW}) - recording probably interrupted",
-                file=sys.stderr,
-            )
+            dropped_short.append(len(current))
 
     for line in read_text_any_encoding(path).splitlines():
         line = line.strip()
@@ -93,7 +111,111 @@ def parse_capture_file(path):
         except ValueError:
             continue  # partial line from a reset mid-print
     flush()
+
+    if dropped_old:
+        print(
+            f"  ! {path.name}: {len(dropped_old)} recordings are in the old 128-row "
+            f"50 Hz format and cannot be converted - re-record this file",
+            file=sys.stderr,
+        )
+    if dropped_short:
+        print(
+            f"  ! {path.name}: dropped {len(dropped_short)} recordings of the wrong "
+            f"length (expected {CAPTURE} rows, saw {sorted(set(dropped_short))}) - "
+            f"interrupted part-way through",
+            file=sys.stderr,
+        )
     return windows
+
+
+def runtime_activity(window):
+    """The firmware's movement measure, evaluated at every sample.
+
+    A copy of `recent_activity` in spells.rs: the mean change per channel over
+    the last RECENT samples. Takes physical units, as the firmware does.
+    """
+    n, channels = window.shape
+    span = RECENT - 1
+
+    steps = np.zeros(n)
+    steps[1:] = np.abs(np.diff(window, axis=0)).sum(axis=1)
+
+    cumulative = np.concatenate([[0.0], np.cumsum(steps)])
+    activity = np.zeros(n)
+    if n > span:
+        activity[span:] = (cumulative[span + 1:] - cumulative[1:n - span + 1]) / (span * channels)
+    return activity
+
+
+def crop_at_runtime_trigger(window):
+    """Cut the window where the firmware would have cut it.
+
+    On the wand there is no choice about which 0.9 s gets classified: the
+    window is whatever had accumulated at the moment movement stopped, so the
+    gesture always sits hard against the end of it. Choosing the *busiest* 0.9 s
+    of a recording instead - the obvious thing, and what this used to do - puts
+    the gesture somewhere near the middle, and where in the window a gesture
+    sits then becomes a feature the model can learn. It is a feature that means
+    nothing, because at runtime the position is fixed by the trigger rather than
+    by how quickly somebody reacted to a prompt.
+
+    So this runs the firmware's own detector over the recording and takes the
+    window ending at the first movement it would have acted on. If the gesture
+    started too early for a full window to precede it, the beginning is padded
+    with the first sample - faithful, because the wand was still before the
+    gesture and that is what the ring buffer would have held.
+
+    Returns None if no movement crosses the threshold, which is normal for the
+    calmer parts of negative.txt.
+    """
+    activity = runtime_activity(window)
+
+    moving = False
+    for i, value in enumerate(activity):
+        if value >= ACTIVE_GATE:
+            moving = True
+        elif moving and value < QUIET_GATE:
+            start = i + 1 - WINDOW
+            if start >= 0:
+                return window[start:i + 1]
+            pad = np.repeat(window[:1], -start, axis=0)
+            return np.concatenate([pad, window[:i + 1]])
+    return None
+
+
+def crop_window(recording):
+    """Reduce a recording to the WINDOW the model is trained on.
+
+    Prefers the window the firmware would have classified; falls back to the
+    busiest one when nothing crossed the movement threshold, so that still and
+    low-energy negative recordings are still usable.
+    """
+    if len(recording) <= WINDOW:
+        return recording
+
+    triggered = crop_at_runtime_trigger(recording)
+    if triggered is not None:
+        return triggered
+
+    # Nothing crossed the threshold, so take the busiest window instead, scored
+    # with the same measure the firmware uses. Measuring change from one sample
+    # to the next rather than deviation from an average matters here: a mean
+    # taken over the whole recording is dragged up by the movement itself, which
+    # makes the still parts either side look active too, and the candidates then
+    # come out so close together that noise decides between them.
+    activity = runtime_activity(recording)
+
+    # Prefix sums turn "total activity of every candidate window" into one
+    # subtraction per position.
+    cumulative = np.concatenate([[0.0], np.cumsum(activity)])
+    totals = cumulative[WINDOW:] - cumulative[:-WINDOW]
+    start = int(np.argmax(totals))
+    return recording[start:start + WINDOW]
+
+
+def count_clipped(recording):
+    """Samples where any axis ran out of range, so its real value is unknown."""
+    return int((np.abs(recording) >= CLIP_LEVEL).any(axis=1).sum())
 
 
 def to_units(window):
@@ -118,31 +240,103 @@ def load_dataset(data_dir, channels):
             continue
         label = path.stem.lower()
         labels.append(label)
+        clipped = 0
         for w in windows:
-            xs.append(to_units(w)[:, :channels])
+            clipped += count_clipped(w)
+            # Units before cropping: the crop reproduces the firmware's movement
+            # detector, whose thresholds are in g and deg/s.
+            xs.append(crop_window(to_units(w))[:, :channels])
             ys.append(len(labels) - 1)
-        print(f"  {label:<10} {len(windows):>4} gestures")
+
+        note = ""
+        if clipped:
+            # Occasional clipping costs little; a lot of it means the peaks of
+            # every hard swing are flat-topped, and flat tops look alike.
+            share = 100.0 * clipped / (len(windows) * CAPTURE)
+            note = f"   ({share:.1f}% of samples out of range)"
+        print(f"  {label:<10} {len(windows):>4} gestures{note}")
 
     x = np.stack(xs).astype(np.float32)
     y = np.array(ys, dtype=np.int32)
     return x, y, labels
 
 
-def augment(x, y, factor, rng):
-    """Expand the set with time-shifted, slightly noisy copies.
+def shift_window(window, n):
+    """Slide a window along in time, holding the end values to fill the gap.
 
-    Hand-recorded gestures are few and never start at exactly the same instant,
-    so shifting teaches the model not to depend on precise alignment.
+    Not np.roll: wrapping would bring the end of a gesture round to the start
+    and invent a movement that never happened. Repeating the first or last
+    sample extends the still part instead, which is what really surrounds a
+    gesture.
+    """
+    if n == 0:
+        return window
+    out = np.empty_like(window)
+    if n > 0:
+        out[:n] = window[0]
+        out[n:] = window[:-n]
+    else:
+        out[n:] = window[-1]
+        out[:n] = window[-n:]
+    return out
+
+
+def augment(x, y, factor, rng):
+    """Expand the set with shifted, rescaled and slightly noisy copies.
+
+    Three things vary between recording and casting, and each gets its own
+    treatment:
+
+    - *When* the gesture falls in the window. On-device the window slides
+      continuously, so the gesture can be anywhere in it, while cropping has
+      put every training example neatly in the middle. Shifting by up to a
+      fifth of the window covers the difference.
+    - *How hard* it was swung. Scaling the magnitude keeps the model reading
+      the shape of a gesture rather than its size - within limits, since a
+      big enough change would turn a spell into a fidget.
+    - Sensor noise, which the added jitter stands in for.
     """
     if factor <= 0:
         return x, y
+
+    max_shift = max(1, WINDOW // 5)
     xs, ys = [x], [y]
     for _ in range(factor):
-        shifted = np.stack([np.roll(w, rng.integers(-12, 13), axis=0) for w in x])
-        shifted += rng.normal(0.0, 0.02, shifted.shape).astype(np.float32)
-        xs.append(shifted.astype(np.float32))
+        copies = np.stack([
+            shift_window(w, int(rng.integers(-max_shift, max_shift + 1))) for w in x
+        ])
+        copies *= rng.uniform(0.85, 1.15, (len(copies), 1, 1)).astype(np.float32)
+        copies += rng.normal(0.0, 0.02, copies.shape).astype(np.float32)
+        xs.append(copies.astype(np.float32))
         ys.append(y)
     return np.concatenate(xs), np.concatenate(ys)
+
+
+def class_weights(y, labels, negative_scale):
+    """Even out the classes, then scale `negative` deliberately.
+
+    A rejection class has far more ground to cover than any one gesture, so
+    `negative.txt` ends up holding more recordings than the spells - here twice
+    as many. Left alone, that imbalance simply teaches the model that "not a
+    spell" is the right answer twice as often as it really is, and genuine
+    gestures get absorbed into it. Weighting each class by the inverse of how
+    much data it brought removes the thumb from the scale.
+
+    `negative_scale` then tunes what the balance cannot: how cautious to be.
+    Below 1.0 the model is readier to call something a spell, which trades
+    missed casts for false ones.
+    """
+    counts = np.bincount(y, minlength=len(labels)).astype(np.float64)
+    total = counts.sum()
+    weights = {}
+    for i, n in enumerate(counts):
+        if n == 0:
+            continue
+        w = total / (len(counts) * n)
+        if labels[i] == "negative":
+            w *= negative_scale
+        weights[i] = w
+    return weights
 
 
 def build_model(tf, channels, n_classes, batch_size=None):
@@ -262,6 +456,11 @@ def main():
     ap.add_argument("--channels", type=int, default=6, choices=(3, 6),
                     help="3 = accel only (like MagicWand), 6 = accel + gyro")
     ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--negative-weight", type=float, default=1.0,
+                    help="how much the negative class counts once the classes "
+                         "have been balanced. Below 1.0 makes the model readier "
+                         "to call a movement a spell, at the cost of more false "
+                         "casts; try 0.7 if real gestures are being swallowed.")
     ap.add_argument("--augment", type=int, default=3,
                     help="extra augmented copies of the training set (0 = off)")
     ap.add_argument("--seed", type=int, default=1)
@@ -309,9 +508,15 @@ def main():
                   metrics=["accuracy"])
     model.summary()
 
+    weights = class_weights(y_train, labels, args.negative_weight)
+    print("\nclass weights:")
+    for i, label in enumerate(labels):
+        print(f"  {label:<10}{weights.get(i, 0.0):.3f}")
+
     model.fit(
         x_train, y_train,
         validation_data=(x_val, y_val),
+        class_weight=weights,
         epochs=args.epochs,
         batch_size=32,
         verbose=2,

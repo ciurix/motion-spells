@@ -35,22 +35,38 @@ missing model cannot break an ordinary `cargo build`.
 
 ## How inference works
 
-The MPU6050 is sampled at 50 Hz into a rolling buffer of the last 128 samples -
-2.56 seconds of accelerometer and gyroscope data, six channels. Every ten
-samples the window is fed through a quantised convolutional network, and a class
-above 80% confidence is announced and broadcast.
+The MPU6050 is sampled at 100 Hz into a rolling buffer of the last 90 samples -
+0.9 seconds of accelerometer and gyroscope data, six channels. The sensor runs
+at ±8 g and ±1000 °/s rather than its defaults, because a fast swipe runs off
+the end of ±2 g and a clipped reading looks the same whichever way the wand
+moved.
 
-Two guards keep it from firing constantly:
+The network is **not** run on a timer. It runs once, when the wand comes to rest
+after being moved:
 
-- a **motion gate** skips windows that hold no real movement, measured as mean
-  absolute deviation from the window's own average, so a wand resting at any
-  angle counts as still
-- a **cooldown** blocks new casts for about 1.5 seconds after one fires, since
-  the same gesture would otherwise be recognised repeatedly as it slides through
-  the window
+- movement is tracked as the mean change per channel over the last 12 samples,
+  with two thresholds - one to decide the wand has started moving, a lower one
+  to decide it has stopped. Measuring change rather than deviation from an
+  average keeps it local, and a wand held still at any angle reads as zero,
+  since gravity is constant however the board is tilted.
+- when it stops, the whole gesture is sitting in the window, and the window is
+  classified.
+- a **cooldown** then blocks new casts for about 1.2 seconds, which also covers
+  bringing the wand back to where it started.
 
-The `negative` class is what properly teaches the model to reject non-gestures;
-the guards above only reduce the damage while it is missing.
+Running on rest rather than on a timer is not just tidiness. Inference takes
+**52 ms** on this chip, during which nothing is sampled. On a timer that pause
+lands in the middle of the swing, punching a hole through the very window being
+classified: the gesture reaches the model with a chunk missing and the rest
+compressed in time, and nothing in the data says so. Waiting for the movement to
+finish puts the pause where nothing is happening anyway.
+
+That 52 ms is with `opt-level = 3`. At the `"s"` the profile used to carry it
+was 105 ms - worth knowing, because size is not the constraint here.
+
+A class above 80% confidence is announced and broadcast. Anything else prints
+what it saw and why it was dropped, which separates "the wand ignored you" from
+"the wand never noticed you".
 
 ## The model
 

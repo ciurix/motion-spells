@@ -1,4 +1,6 @@
 down
 left
+negative
+push
 right
 up
