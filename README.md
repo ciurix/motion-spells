@@ -33,6 +33,7 @@ displays the network operation it maps to.
 ```
 wand/         ESP32-S3 firmware, gesture model, and training pipeline
 controller/   STM32 firmware and the NodeMCU radio bridge
+tools/        one-shot setup and flash scripts for a new Windows machine
 ```
 
 Each directory is its own Cargo project with its own toolchain - `wand/` builds
@@ -49,6 +50,24 @@ Build from inside them, not from the repository root.
 
 Power the NodeMCU from its own USB or the Nucleo's 5V pin. Its transmit current
 spikes will brown out the Nucleo's 3.3V regulator.
+
+## Setting up on a new machine
+
+Three boards means three toolchains. On 64-bit Windows, both are scripted:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\install.ps1
+# open a new terminal, plug in all three boards
+powershell -ExecutionPolicy Bypass -File tools\flash-all.ps1
+```
+
+`install.ps1` installs the Rust toolchains (stable and Xtensa), espflash,
+probe-rs, arduino-cli with the ESP8266 core, Python with the manager's
+dependencies, and prompts for the credentials that go in the gitignored `.env`.
+
+`flash-all.ps1` builds and flashes each board in turn, listens to it afterwards
+to confirm it came up, and finishes by casting a spell from the wand with no
+gesture to check the whole chain. See `tools/README.md`.
 
 ## Running it
 

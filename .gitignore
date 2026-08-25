@@ -14,3 +14,6 @@ spells_training.zip
 # Colab downloads land in the root; the tracked copies live in model/
 /spells.tflite
 /labels.txt
+
+# Flash/verify logs written by tools/flash-all.ps1
+tools/logs/
