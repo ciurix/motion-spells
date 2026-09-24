@@ -1,14 +1,7 @@
 # WIFI Commander
 A network administration tool designed specifically for OpenWRT routers.
 
-:::info
-
-**Author**: Ciuraru Mircea-Georgian \
-**GitHub Project Link**: https://github.com/UPB-PMRust-Students/fils-project-2026-ciurix
-
-:::
-
-<!-- do not delete the \ after your name -->
+**Author**: Ciuraru Mircea-Georgian
 
 ## Description
 
@@ -63,7 +56,6 @@ The final implementation is distributed across the wand, a radio bridge, an STM3
                                                             +-------------------+
 ```
 
-![Project Architecture](architecture.svg)
 
 ### WIFI Wand
 
